@@ -135,4 +135,83 @@ class DecisionClient(private val baseUrl: String) {
             )
         }
     }
+
+    fun debugProbe(
+        goalId: String,
+        rawNodes: List<RawUiNode>,
+        xmlLike: String,
+        screenshotPngBytes: ByteArray
+    ): Result<DebugProbeResult> {
+        return try {
+            val rawNodesJson = JSONArray().apply {
+                rawNodes.forEach { n ->
+                    put(
+                        JSONObject().apply {
+                            put("node_id", n.nodeId)
+                            put("x1", n.x1)
+                            put("y1", n.y1)
+                            put("x2", n.x2)
+                            put("y2", n.y2)
+                            put("center_x", n.centerX)
+                            put("center_y", n.centerY)
+                            put("class", n.className)
+                            put("package", n.packageName)
+                            put("clickable", n.clickable)
+                            put("enabled", n.enabled)
+                            put("focusable", n.focusable)
+                            put("child_count", n.childCount)
+                        }
+                    )
+                }
+            }
+
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("goal_id", goalId)
+                .addFormDataPart("raw_nodes_json", rawNodesJson.toString())
+                .addFormDataPart("ui_xml_like", xmlLike)
+                .addFormDataPart(
+                    "screenshot_file",
+                    "frame.png",
+                    screenshotPngBytes.toRequestBody("image/png".toMediaType())
+                )
+                .build()
+
+            val request = Request.Builder()
+                .url("$baseUrl/v2/debug_probe")
+                .post(body)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val rawBody = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return Result.failure(IllegalStateException("debug_probe_http_${response.code}: ${rawBody.take(240)}"))
+                }
+                val json = JSONObject(rawBody)
+                val candidates = json.optJSONArray("candidates")
+                val summary = buildString {
+                    append("page=")
+                    append(json.optString("page_id", "unknown"))
+                    append(" 候选=")
+                    append(candidates?.length() ?: 0)
+                    val first = if ((candidates?.length() ?: 0) > 0) candidates?.optJSONObject(0) else null
+                    val firstLabel = first?.optString("label", "") ?: ""
+                    if (firstLabel.isNotEmpty()) {
+                        append(" 首项=")
+                        append(firstLabel)
+                    }
+                }
+                Result.success(
+                    DebugProbeResult(
+                        pageId = json.optString("page_id", "unknown"),
+                        rawNodeCount = json.optInt("raw_node_count", rawNodes.size),
+                        candidateCount = candidates?.length() ?: 0,
+                        summary = summary
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 }

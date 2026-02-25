@@ -162,6 +162,49 @@ class AutomationAccessibilityService : AccessibilityService() {
         return if (actionableOut.isNotEmpty()) actionableOut else candidateOut
     }
 
+    fun dumpRawNodes(maxNodes: Int = 300): List<RawUiNode> {
+        val root = rootInActiveWindow ?: return emptyList()
+        val out = ArrayList<RawUiNode>()
+        val seen = HashSet<String>()
+
+        fun walk(node: AccessibilityNodeInfo?) {
+            if (node == null || out.size >= maxNodes) return
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            val validRect = rect.right > rect.left && rect.bottom > rect.top
+            if (validRect) {
+                val className = node.className?.toString().orEmpty()
+                val packageName = node.packageName?.toString().orEmpty()
+                val key = "${rect.left},${rect.top},${rect.right},${rect.bottom}|$className|$packageName|raw"
+                if (seen.add(key)) {
+                    out.add(
+                        RawUiNode(
+                            nodeId = sha1Hex(key).take(16),
+                            x1 = rect.left,
+                            y1 = rect.top,
+                            x2 = rect.right,
+                            y2 = rect.bottom,
+                            centerX = (rect.left + rect.right) / 2,
+                            centerY = (rect.top + rect.bottom) / 2,
+                            className = className,
+                            packageName = packageName,
+                            clickable = node.isClickable,
+                            enabled = node.isEnabled,
+                            focusable = node.isFocusable,
+                            childCount = node.childCount
+                        )
+                    )
+                }
+            }
+            for (i in 0 until node.childCount) {
+                walk(node.getChild(i))
+            }
+        }
+
+        walk(root)
+        return out
+    }
+
     private fun sha1Hex(raw: String): String {
         val digest = MessageDigest.getInstance("SHA-1").digest(raw.toByteArray())
         return digest.joinToString("") { "%02x".format(it) }

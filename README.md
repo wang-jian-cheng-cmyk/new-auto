@@ -22,6 +22,10 @@ This repo now uses only the V2 framework.
 3. App sends `/decide_v2` with screenshot + actionable node list + recent history.
 4. Gateway returns `click/wait` and app executes with accessibility tap.
 
+Debug probe:
+
+- Floating button `测试:原始UI分析` sends raw nodes + xml-like + screenshot to `/v2/debug_probe`.
+
 ## Learning Flow
 
 1. Use floating panel learning actions (`前截图/后截图/提交步骤/结束序列`).

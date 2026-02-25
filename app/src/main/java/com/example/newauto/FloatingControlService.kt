@@ -106,6 +106,7 @@ class FloatingControlService : Service() {
         val pauseBtn = Button(this).apply { text = "暂停自动" }
         val learnModeBtn = Button(this).apply { text = "学习模式: 关" }
         val testTapBtn = Button(this).apply { text = "测试点击" }
+        val probeRawUiBtn = Button(this).apply { text = "测试:原始UI分析" }
         val screenInfoBtn = Button(this).apply { text = "查看屏幕大小" }
         val openA11yBtn = Button(this).apply { text = "打开无障碍设置" }
         val diagnoseBtn = Button(this).apply { text = "连接诊断" }
@@ -194,6 +195,57 @@ class FloatingControlService : Service() {
             }
             val ok = svc?.tap((width * 0.5).toInt(), (height * 0.6).toInt(), 120) == true
             statusText.text = if (ok) "状态: 测试点击已发送" else "状态: 测试点击失败"
+        }
+
+        probeRawUiBtn.setOnClickListener {
+            serviceScope.launch(Dispatchers.IO) {
+                if (!AutomationAccessibilityService.isServiceReady(this@FloatingControlService)) {
+                    withContext(Dispatchers.Main) {
+                        statusText.text = "状态: ${diagnoseAccessibilityState()}"
+                    }
+                    return@launch
+                }
+
+                val ok = ScreenCaptureManager.initIfNeeded(this@FloatingControlService)
+                withContext(Dispatchers.Main) {
+                    if (!ok) {
+                        statusText.text = "状态: 请先在主界面申请录屏权限"
+                    } else {
+                        statusText.text = "状态: 截图中"
+                    }
+                }
+                if (!ok) return@launch
+
+                val png = captureFrameWithoutOverlay()
+                if (png == null) {
+                    withContext(Dispatchers.Main) {
+                        statusText.text = "状态: 调试截图失败"
+                    }
+                    return@launch
+                }
+
+                val rawNodes = AutomationAccessibilityService.instance?.dumpRawNodes().orEmpty()
+                val xmlLike = buildXmlLike(rawNodes)
+
+                withContext(Dispatchers.Main) {
+                    statusText.text = "状态: 等待模型分析(${rawNodes.size}节点)"
+                }
+
+                val result = decisionClient.debugProbe(
+                    goalId = "daily_loop",
+                    rawNodes = rawNodes,
+                    xmlLike = xmlLike,
+                    screenshotPngBytes = png
+                )
+
+                withContext(Dispatchers.Main) {
+                    statusText.text = result.fold(
+                        onSuccess = { "状态: ${it.summary}" },
+                        onFailure = { "状态: 调试失败(${it.message?.take(80)})" }
+                    )
+                    ensureOverlayVisible()
+                }
+            }
         }
 
         screenInfoBtn.setOnClickListener {
@@ -285,6 +337,7 @@ class FloatingControlService : Service() {
         controlsLayout.addView(learnSubmitBtn)
         controlsLayout.addView(learnFinishBtn)
         controlsLayout.addView(testTapBtn)
+        controlsLayout.addView(probeRawUiBtn)
         controlsLayout.addView(screenInfoBtn)
         controlsLayout.addView(openA11yBtn)
         controlsLayout.addView(diagnoseBtn)
@@ -381,6 +434,39 @@ class FloatingControlService : Service() {
         val metrics = resources.displayMetrics
         val orientation = if (metrics.widthPixels > metrics.heightPixels) "横屏" else "竖屏"
         return "${metrics.widthPixels}x${metrics.heightPixels} ($orientation)"
+    }
+
+    private fun buildXmlLike(rawNodes: List<RawUiNode>): String {
+        val sb = StringBuilder()
+        sb.append("<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>")
+        sb.append("<hierarchy rotation=\"1\">")
+        rawNodes.forEachIndexed { idx, n ->
+            sb.append("<node ")
+            sb.append("index=\"").append(idx).append("\" ")
+            sb.append("text=\"\" ")
+            sb.append("resource-id=\"\" ")
+            sb.append("class=\"").append(escapeXml(n.className)).append("\" ")
+            sb.append("package=\"").append(escapeXml(n.packageName)).append("\" ")
+            sb.append("content-desc=\"\" ")
+            sb.append("clickable=\"").append(n.clickable).append("\" ")
+            sb.append("enabled=\"").append(n.enabled).append("\" ")
+            sb.append("focusable=\"").append(n.focusable).append("\" ")
+            sb.append("child-count=\"").append(n.childCount).append("\" ")
+            sb.append("bounds=\"[")
+                .append(n.x1).append(",").append(n.y1)
+                .append("][")
+                .append(n.x2).append(",").append(n.y2)
+                .append("]\" />")
+        }
+        sb.append("</hierarchy>")
+        return sb.toString()
+    }
+
+    private fun escapeXml(raw: String): String {
+        return raw.replace("&", "&amp;")
+            .replace("\"", "&quot;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
     }
 
     private suspend fun captureFrameWithoutOverlay(): ByteArray? {

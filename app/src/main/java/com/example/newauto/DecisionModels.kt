@@ -40,6 +40,29 @@ data class UiActionableNode(
     val source: String
 )
 
+data class RawUiNode(
+    val nodeId: String,
+    val x1: Int,
+    val y1: Int,
+    val x2: Int,
+    val y2: Int,
+    val centerX: Int,
+    val centerY: Int,
+    val className: String,
+    val packageName: String,
+    val clickable: Boolean,
+    val enabled: Boolean,
+    val focusable: Boolean,
+    val childCount: Int
+)
+
+data class DebugProbeResult(
+    val pageId: String,
+    val rawNodeCount: Int,
+    val candidateCount: Int,
+    val summary: String
+)
+
 sealed class DecisionResult {
     data class Success(val response: DecisionResponse) : DecisionResult()
     data class Failure(

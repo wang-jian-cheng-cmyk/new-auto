@@ -242,6 +242,50 @@ async def analyze_xml_endpoint(
     }
 
 
+@app.post("/v2/debug_probe")
+async def debug_probe(
+    goal_id: str = Form("daily_loop"),
+    raw_nodes_json: str = Form("[]"),
+    ui_xml_like: str = Form(""),
+    screenshot_file: UploadFile = File(...),
+) -> dict[str, Any]:
+    request_id = uuid.uuid4().hex[:12]
+    started = time.time()
+    screenshot_path = TMP_DIR / f"probe-{request_id}.png"
+    screenshot_path.write_bytes(await screenshot_file.read())
+
+    try:
+        raw_nodes = json.loads(raw_nodes_json)
+        if not isinstance(raw_nodes, list):
+            raw_nodes = []
+    except Exception:
+        raw_nodes = []
+
+    page_id = build_page_id_from_raw_nodes(raw_nodes)
+    prompt = build_debug_probe_prompt(goal_id, page_id, raw_nodes, ui_xml_like)
+    payload = extract_json(call_opencode(prompt, str(screenshot_path)))
+    candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+    if not isinstance(candidates, list):
+        candidates = []
+
+    log_event(
+        "debug_probe_done",
+        request_id=request_id,
+        page_id=page_id,
+        raw_nodes=len(raw_nodes),
+        candidates=len(candidates),
+        elapsed_ms=int((time.time() - started) * 1000),
+    )
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "goal_id": goal_id,
+        "page_id": page_id,
+        "raw_node_count": len(raw_nodes),
+        "candidates": candidates,
+    }
+
+
 @app.post("/learn_v2")
 async def learn_v2(request: Request) -> dict[str, Any]:
     request_id = uuid.uuid4().hex[:12]
@@ -797,6 +841,55 @@ def build_user_prompt(
             "goal_id": req.current_goal_id,
             "reason": "short_cn_reason",
         },
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def build_page_id_from_raw_nodes(raw_nodes: list[dict]) -> str:
+    normalized = []
+    for n in raw_nodes:
+        if not isinstance(n, dict):
+            continue
+        x1 = int(n.get("x1", 0))
+        y1 = int(n.get("y1", 0))
+        x2 = int(n.get("x2", 0))
+        y2 = int(n.get("y2", 0))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        normalized.append((x1, y1, x2, y2, str(n.get("class", "")), bool(n.get("clickable", False)), bool(n.get("enabled", False))))
+    normalized.sort()
+    raw = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return uuid.uuid5(uuid.NAMESPACE_URL, raw).hex[:20]
+
+
+def build_debug_probe_prompt(goal_id: str, page_id: str, raw_nodes: list[dict], ui_xml_like: str) -> str:
+    payload = {
+        "task": "分析手游页面按钮候选，不要只依赖clickable=true",
+        "goal_id": goal_id,
+        "page_id": page_id,
+        "raw_nodes_count": len(raw_nodes),
+        "raw_nodes": raw_nodes[:200],
+        "xml_like": ui_xml_like[:20000],
+        "output": {
+            "candidates": [
+                {
+                    "label": "tap_skip|toggle_auto_battle|close|task|other",
+                    "reason": "short_reason",
+                    "button_id": "if matched",
+                    "x1": 0,
+                    "y1": 0,
+                    "x2": 0,
+                    "y2": 0,
+                    "cx": 0,
+                    "cy": 0,
+                }
+            ]
+        },
+        "rules": [
+            "只输出JSON对象",
+            "候选可以来自非clickable节点",
+            "优先输出有明确语义的按钮",
+        ],
     }
     return json.dumps(payload, ensure_ascii=False)
 
