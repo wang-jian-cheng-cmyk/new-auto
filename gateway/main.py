@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -21,12 +22,18 @@ TMP_DIR.mkdir(exist_ok=True)
 SYSTEM_PROMPT = (BASE_DIR / "system_prompt.txt").read_text(encoding="utf-8")
 EXPERIENCE_LIBRARY_PATH = BASE_DIR / "experience_library.json"
 LEARN_DEMOS_PATH = BASE_DIR / "learn_demos.jsonl"
+LEARN_QUEUE_PATH = BASE_DIR / "learn_queue.json"
 MODEL = os.getenv("MODEL", "openai/gpt-5.2")
 
 if EXPERIENCE_LIBRARY_PATH.exists():
     EXPERIENCE_LIBRARY = json.loads(EXPERIENCE_LIBRARY_PATH.read_text(encoding="utf-8"))
 else:
     EXPERIENCE_LIBRARY = {"skills": [], "action_profiles": []}
+
+if LEARN_QUEUE_PATH.exists():
+    LEARN_QUEUE = json.loads(LEARN_QUEUE_PATH.read_text(encoding="utf-8"))
+else:
+    LEARN_QUEUE: list[dict] = []
 
 
 class HistoryItem(BaseModel):
@@ -74,23 +81,31 @@ class SessionContext:
 
 SESSION_STORE: dict[str, SessionContext] = {}
 LEARN_SESSION_BUFFER: dict[str, list[dict]] = {}
+LEARN_QUEUE_LOCK = asyncio.Lock()
 
-app = FastAPI(title="New Auto Gateway", version="0.2.0")
+app = FastAPI(title="New Auto Gateway", version="0.3.0")
 
 
 @app.get("/health")
 def health() -> dict:
+    pending = len([t for t in LEARN_QUEUE if t.get("status") in {"pending", "failed"}])
     return {
         "ok": True,
         "model": MODEL,
         "skills": len(EXPERIENCE_LIBRARY.get("skills", [])),
         "action_profiles": len(EXPERIENCE_LIBRARY.get("action_profiles", [])),
+        "learn_queue_pending": pending,
     }
 
 
 @app.get("/experience")
 def experience() -> dict:
     return EXPERIENCE_LIBRARY
+
+
+@app.get("/learn/queue")
+def learn_queue() -> dict:
+    return {"items": LEARN_QUEUE[-100:]}
 
 
 @app.post("/learn")
@@ -103,6 +118,8 @@ async def learn(request: Request) -> dict:
         description = str(form.get("description", "")).strip()
         action_type = str(form.get("action_type", "click"))
         intent = str(form.get("intent", "observe_state"))
+        skill_tags = parse_tags(str(form.get("skill_tags", "")))
+        scene_tags = parse_tags(str(form.get("scene_tags", "")))
         x = int(form.get("x", "0"))
         y = int(form.get("y", "0"))
         wait_ms = int(form.get("wait_ms", "1200"))
@@ -134,63 +151,40 @@ async def learn(request: Request) -> dict:
     before_name.write_bytes(await before_file.read())
     after_name.write_bytes(await after_file.read())
 
-    step = {
-        "action": "click" if action_type == "click" else "wait",
-        "intent": intent,
-        "x": max(0, x),
-        "y": max(0, y),
-        "wait_ms": clamp(wait_ms, 300, 5000),
-        "reason": description or "manual_learned_step",
+    task = {
+        "task_id": request_id,
+        "status": "pending",
+        "retry_count": 0,
+        "created_at_ms": int(time.time() * 1000),
+        "updated_at_ms": int(time.time() * 1000),
+        "request": {
+            "session_id": session_id,
+            "goal_id": goal_id,
+            "description": description,
+            "action_type": action_type,
+            "intent": intent,
+            "skill_tags": skill_tags,
+            "scene_tags": scene_tags,
+            "x": max(0, x),
+            "y": max(0, y),
+            "wait_ms": clamp(wait_ms, 300, 5000),
+            "sequence_done": sequence_done,
+            "before_path": str(before_name),
+            "after_path": str(after_name),
+        },
     }
 
-    demo = {
-        "request_id": request_id,
-        "session_id": session_id,
-        "goal_id": goal_id,
-        "description": description,
-        "step": step,
-        "before_path": str(before_name),
-        "after_path": str(after_name),
-        "sequence_done": sequence_done,
-        "timestamp_ms": int(time.time() * 1000),
-    }
-    with LEARN_DEMOS_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(demo, ensure_ascii=False) + "\n")
+    LEARN_QUEUE.append(task)
+    persist_learn_queue()
+    await process_learn_queue()
 
-    LEARN_SESSION_BUFFER.setdefault(session_id, []).append(step)
-    upsert_action_profile(goal_id, step, success=True, effect="changed")
-
-    if sequence_done:
-        steps = LEARN_SESSION_BUFFER.pop(session_id, [])
-        if steps:
-            skill_id = f"manual_{goal_id}_{int(time.time())}"
-            skill = {
-                "skill_id": skill_id,
-                "goal_id": goal_id,
-                "description": description or "manual learned sequence",
-                "precondition": {
-                    "description_keywords": extract_keywords(description),
-                    "trigger_intents": [steps[0].get("intent", "observe_state")],
-                },
-                "steps": steps,
-                "stats": {"success": 0, "failed": 0, "updated_at_ms": int(time.time() * 1000)},
-            }
-            EXPERIENCE_LIBRARY.setdefault("skills", []).append(skill)
-            persist_experience_library()
-            return {
-                "ok": True,
-                "message": f"learned sequence saved as {skill_id}",
-                "request_id": request_id,
-                "skill_id": skill_id,
-                "steps": len(steps),
-            }
-
-    persist_experience_library()
+    saved = next((x for x in LEARN_QUEUE if x.get("task_id") == request_id), task)
     return {
-        "ok": True,
-        "message": "learn step appended",
-        "request_id": request_id,
-        "buffer_steps": len(LEARN_SESSION_BUFFER.get(session_id, [])),
+        "ok": saved.get("status") == "done",
+        "queued": True,
+        "task_id": request_id,
+        "status": saved.get("status", "pending"),
+        "message": saved.get("message", "learn task queued"),
     }
 
 
@@ -248,6 +242,115 @@ async def decide(request: Request) -> DecideResponse:
         )
 
 
+async def process_learn_queue() -> None:
+    async with LEARN_QUEUE_LOCK:
+        changed = False
+        for item in LEARN_QUEUE:
+            if item.get("status") not in {"pending", "failed"}:
+                continue
+            if int(item.get("retry_count", 0)) >= 3:
+                continue
+
+            item["status"] = "sending"
+            item["updated_at_ms"] = int(time.time() * 1000)
+            changed = True
+            try:
+                message = process_learn_task(item)
+                item["status"] = "done"
+                item["message"] = message
+                item["last_error"] = ""
+            except Exception as exc:
+                item["status"] = "failed"
+                item["retry_count"] = int(item.get("retry_count", 0)) + 1
+                item["last_error"] = str(exc)
+            item["updated_at_ms"] = int(time.time() * 1000)
+            changed = True
+
+        if changed:
+            persist_learn_queue()
+            persist_experience_library()
+
+
+def process_learn_task(task: dict) -> str:
+    req = task.get("request", {})
+    session_id = str(req.get("session_id", "device-local"))
+    goal_id = str(req.get("goal_id", "daily_loop"))
+    description = str(req.get("description", "")).strip()
+    intent = str(req.get("intent", "observe_state"))
+    skill_tags = parse_tags_list(req.get("skill_tags", []))
+    scene_tags = parse_tags_list(req.get("scene_tags", []))
+    sequence_done = bool(req.get("sequence_done", False))
+
+    step = {
+        "action": "click" if str(req.get("action_type", "click")) == "click" else "wait",
+        "intent": intent,
+        "x": int(req.get("x", 0)),
+        "y": int(req.get("y", 0)),
+        "wait_ms": clamp(int(req.get("wait_ms", 1200)), 300, 5000),
+        "reason": description or "manual_learned_step",
+        "tags": sorted(set(skill_tags + scene_tags + [intent])),
+    }
+
+    demo = {
+        "task_id": task.get("task_id", ""),
+        "session_id": session_id,
+        "goal_id": goal_id,
+        "description": description,
+        "step": step,
+        "before_path": str(req.get("before_path", "")),
+        "after_path": str(req.get("after_path", "")),
+        "skill_tags": skill_tags,
+        "scene_tags": scene_tags,
+        "sequence_done": sequence_done,
+        "timestamp_ms": int(time.time() * 1000),
+    }
+
+    with LEARN_DEMOS_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(demo, ensure_ascii=False) + "\n")
+
+    LEARN_SESSION_BUFFER.setdefault(session_id, []).append(step)
+    upsert_action_profile(goal_id, step, success=True, effect="changed")
+
+    if not sequence_done:
+        return "learn step appended"
+
+    steps = LEARN_SESSION_BUFFER.pop(session_id, [])
+    if not steps:
+        return "sequence_done with empty buffer"
+
+    all_step_tags: list[str] = []
+    all_intents: list[str] = []
+    for s in steps:
+        all_step_tags.extend(parse_tags_list(s.get("tags", [])))
+        all_intents.append(str(s.get("intent", "observe_state")))
+
+    merged_skill_tags = sorted(set(skill_tags + scene_tags + all_step_tags + [goal_id]))
+    merged_scene_tags = sorted(set(scene_tags + extract_keywords(description)))
+    trigger_intents = sorted(set(all_intents))[:5]
+
+    skill_id = f"manual_{goal_id}_{int(time.time())}"
+    skill = {
+        "skill_id": skill_id,
+        "goal_id": goal_id,
+        "description": description or "manual learned sequence",
+        "skill_tags": merged_skill_tags,
+        "precondition": {
+            "trigger_intents": trigger_intents,
+            "scene_tags": merged_scene_tags,
+            "description_keywords": extract_keywords(description),
+        },
+        "steps": steps,
+        "stats": {
+            "success": 0,
+            "failed": 0,
+            "updated_at_ms": int(time.time() * 1000),
+        },
+    }
+
+    EXPERIENCE_LIBRARY.setdefault("skills", []).append(skill)
+    return f"learned sequence saved as {skill_id}"
+
+
 def next_skill_step(req: DecideRequest, session: SessionContext) -> DecideResponse | None:
     if not session.active_steps:
         return None
@@ -268,22 +371,46 @@ def next_skill_step(req: DecideRequest, session: SessionContext) -> DecideRespon
 
 
 def trigger_skill(req: DecideRequest, session: SessionContext) -> DecideResponse | None:
-    last_intent = req.history[-1].intent if req.history else ""
-    last_reason = req.history[-1].reason if req.history else ""
+    if not req.history:
+        return None
+
+    last = req.history[-1]
+    scored: list[tuple[int, dict]] = []
     for skill in EXPERIENCE_LIBRARY.get("skills", []):
         if skill.get("goal_id") != req.current_goal_id:
             continue
-        pre = skill.get("precondition", {})
-        trigger_intents = pre.get("trigger_intents", [])
-        keywords = pre.get("description_keywords", [])
-        hit_intent = not trigger_intents or last_intent in trigger_intents
-        hit_keyword = not keywords or any(str(k) in last_reason for k in keywords)
-        if hit_intent and hit_keyword:
-            session.active_skill_id = str(skill.get("skill_id", ""))
-            session.active_steps = deque(skill.get("steps", []))
-            session.active_step_index = 0
-            return next_skill_step(req, session)
-    return None
+        score = score_skill_match(skill, last)
+        if score > 0:
+            scored.append((score, skill))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = scored[0][1]
+    session.active_skill_id = str(best.get("skill_id", ""))
+    session.active_steps = deque(best.get("steps", []))
+    session.active_step_index = 0
+    return next_skill_step(req, session)
+
+
+def score_skill_match(skill: dict, last: HistoryItem) -> int:
+    score = 0
+    pre = skill.get("precondition", {})
+    trigger_intents = parse_tags_list(pre.get("trigger_intents", []))
+    scene_tags = parse_tags_list(pre.get("scene_tags", []))
+    keywords = parse_tags_list(pre.get("description_keywords", []))
+    skill_tags = parse_tags_list(skill.get("skill_tags", []))
+
+    if trigger_intents and last.intent in trigger_intents:
+        score += 4
+    if scene_tags and any(tag in last.reason for tag in scene_tags):
+        score += 3
+    if keywords and any(k in last.reason for k in keywords):
+        score += 2
+    if skill_tags and (last.intent in skill_tags or any(t in last.reason for t in skill_tags)):
+        score += 1
+    return score
 
 
 def should_call_opencode(req: DecideRequest, session: SessionContext) -> bool:
@@ -354,12 +481,18 @@ def update_profiles_from_history(goal_id: str, history: list[HistoryItem]) -> No
     last = history[-1]
     if last.action not in {"click", "wait"}:
         return
-    upsert_action_profile(goal_id, {
-        "intent": last.intent,
-        "x": last.x,
-        "y": last.y,
-        "wait_ms": last.wait_ms,
-    }, success=last.result == "ok", effect=last.effect)
+    upsert_action_profile(
+        goal_id,
+        {
+            "intent": last.intent,
+            "x": last.x,
+            "y": last.y,
+            "wait_ms": last.wait_ms,
+            "tags": [last.intent],
+        },
+        success=last.result == "ok",
+        effect=last.effect,
+    )
 
 
 def upsert_action_profile(goal_id: str, step: dict, success: bool, effect: str) -> None:
@@ -384,6 +517,7 @@ def upsert_action_profile(goal_id: str, step: dict, success: bool, effect: str) 
     if profile is None:
         profile = {
             **key,
+            "tags": parse_tags_list(step.get("tags", [])),
             "recommended_wait_ms": clamp(int(step.get("wait_ms", 1000)), 300, 5000),
             "success_count": 0,
             "fail_count": 0,
@@ -464,8 +598,8 @@ async def parse_decide_request(request: Request) -> DecideRequest:
 
 
 def build_user_prompt(req: DecideRequest) -> str:
-    skills = EXPERIENCE_LIBRARY.get("skills", [])[:6]
-    profiles = EXPERIENCE_LIBRARY.get("action_profiles", [])[-20:]
+    skills = EXPERIENCE_LIBRARY.get("skills", [])[:8]
+    profiles = EXPERIENCE_LIBRARY.get("action_profiles", [])[-30:]
     data = {
         "task": "根据截图选择下一步搬砖动作，目标是稳定提高银两收益",
         "output_schema": {
@@ -571,13 +705,28 @@ def fallback_wait(goal_id: str, reason: str, wait_ms: int = 1000) -> DecideRespo
     )
 
 
+def parse_tags(raw: str) -> list[str]:
+    if not raw:
+        return []
+    cleaned = [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
+    return sorted(set(cleaned))[:16]
+
+
+def parse_tags_list(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return sorted(set([str(x).strip() for x in raw if str(x).strip()]))[:16]
+    if isinstance(raw, str):
+        return parse_tags(raw)
+    return []
+
+
 def sanitize_filename(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in {"-", "_", "."})
 
 
 def extract_keywords(text: str) -> list[str]:
     cleaned = [t.strip() for t in text.replace("，", " ").replace(",", " ").split() if t.strip()]
-    return cleaned[:4]
+    return cleaned[:6]
 
 
 def clamp(v: int, lo: int, hi: int) -> int:
@@ -587,5 +736,12 @@ def clamp(v: int, lo: int, hi: int) -> int:
 def persist_experience_library() -> None:
     EXPERIENCE_LIBRARY_PATH.write_text(
         json.dumps(EXPERIENCE_LIBRARY, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def persist_learn_queue() -> None:
+    LEARN_QUEUE_PATH.write_text(
+        json.dumps(LEARN_QUEUE, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

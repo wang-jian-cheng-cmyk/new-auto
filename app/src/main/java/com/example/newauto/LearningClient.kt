@@ -21,6 +21,8 @@ class LearningClient(private val baseUrl: String) {
         description: String,
         actionType: String,
         intent: String,
+        skillTags: String,
+        sceneTags: String,
         x: Int,
         y: Int,
         waitMs: Int,
@@ -36,6 +38,8 @@ class LearningClient(private val baseUrl: String) {
                 .addFormDataPart("description", description)
                 .addFormDataPart("action_type", actionType)
                 .addFormDataPart("intent", intent)
+                .addFormDataPart("skill_tags", skillTags)
+                .addFormDataPart("scene_tags", sceneTags)
                 .addFormDataPart("x", x.toString())
                 .addFormDataPart("y", y.toString())
                 .addFormDataPart("wait_ms", waitMs.toString())

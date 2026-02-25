@@ -8,5 +8,6 @@
 /app/build/
 gateway/tmp/
 gateway/learn_demos.jsonl
+gateway/learn_queue.json
 gateway/__pycache__/
 *.pyc

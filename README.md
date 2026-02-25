@@ -36,8 +36,13 @@ In floating panel:
 - Turn on learning mode.
 - Record `学:记录前截图` and `学:记录后截图` around your manual operation.
 - Submit by `学:提交步骤` or finish sequence by `学:结束序列`.
+- Learning submit now uses queue persistence and tag fields (`skill_tags`, `scene_tags`).
 
 Gateway endpoint defaults to `http://127.0.0.1:8787` (`/decide`, `/learn`).
+
+Learning queue endpoint:
+
+- `GET /learn/queue`
 
 ## Gateway run
 

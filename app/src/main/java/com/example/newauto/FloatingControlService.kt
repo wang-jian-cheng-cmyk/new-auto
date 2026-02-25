@@ -45,6 +45,8 @@ class FloatingControlService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var loopJob: Job? = null
     private val captureMutex = Mutex()
+    @Volatile
+    private var captureHideActive = false
 
     private val learningClient by lazy { LearningClient(baseUrl = "http://127.0.0.1:8787") }
     private val decisionClient by lazy { DecisionClient(baseUrl = "http://127.0.0.1:8787") }
@@ -59,6 +61,8 @@ class FloatingControlService : Service() {
     private var learnGoalId = "daily_loop"
     private var learnActionType = "click"
     private var learnIntent = "observe_state"
+    private var learnSkillTags = ""
+    private var learnSceneTags = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -74,6 +78,7 @@ class FloatingControlService : Service() {
         super.onDestroy()
         stopLoop("服务停止")
         rootView?.let { windowManager.removeView(it) }
+        rootView = null
         serviceScope.cancel()
     }
 
@@ -224,6 +229,7 @@ class FloatingControlService : Service() {
                         learningBeforePng = png
                         statusText.text = "状态: 已记录前截图"
                     }
+                    ensureOverlayVisible()
                 }
             }
         }
@@ -246,6 +252,7 @@ class FloatingControlService : Service() {
                         learningAfterPng = png
                         statusText.text = "状态: 已记录后截图"
                     }
+                    ensureOverlayVisible()
                 }
             }
         }
@@ -380,19 +387,41 @@ class FloatingControlService : Service() {
         return captureMutex.withLock {
             val view = rootView
             if (view == null) return@withLock ScreenCaptureManager.capturePngBytes()
+            val previousVisibility = view.visibility
             try {
                 withContext(Dispatchers.Main) {
+                    captureHideActive = true
                     view.visibility = View.GONE
                 }
                 delay(80)
                 ScreenCaptureManager.capturePngBytes()
             } finally {
                 withContext(Dispatchers.Main) {
+                    captureHideActive = false
                     if (view.parent != null) {
-                        view.visibility = View.VISIBLE
+                        view.visibility = previousVisibility
+                    } else {
+                        ensureOverlayVisible()
                     }
                 }
             }
+        }
+    }
+
+    private fun ensureOverlayVisible() {
+        if (captureHideActive) return
+        val view = rootView
+        if (view == null) {
+            showFloatingWindow()
+            return
+        }
+        if (view.parent == null) {
+            rootView = null
+            showFloatingWindow()
+            return
+        }
+        if (view.visibility != View.VISIBLE) {
+            view.visibility = View.VISIBLE
         }
     }
 
@@ -440,6 +469,14 @@ class FloatingControlService : Service() {
             hint = "intent (tap_skip/toggle_auto_battle/observe_state)"
             setText(learnIntent)
         }
+        val skillTagsInput = EditText(this).apply {
+            hint = "skill_tags (comma-separated)"
+            setText(learnSkillTags)
+        }
+        val sceneTagsInput = EditText(this).apply {
+            hint = "scene_tags (comma-separated)"
+            setText(learnSceneTags)
+        }
         val xInput = EditText(this).apply {
             hint = "x"
             setText(learnX.toString())
@@ -457,6 +494,8 @@ class FloatingControlService : Service() {
         container.addView(goalInput)
         container.addView(actionInput)
         container.addView(intentInput)
+        container.addView(skillTagsInput)
+        container.addView(sceneTagsInput)
         container.addView(xInput)
         container.addView(yInput)
         container.addView(waitInput)
@@ -470,6 +509,8 @@ class FloatingControlService : Service() {
                 val goalId = goalInput.text?.toString().orEmpty().trim().ifEmpty { "daily_loop" }
                 val actionType = actionInput.text?.toString().orEmpty().trim().ifEmpty { "click" }
                 val intent = intentInput.text?.toString().orEmpty().trim().ifEmpty { "observe_state" }
+                val skillTags = skillTagsInput.text?.toString().orEmpty().trim()
+                val sceneTags = sceneTagsInput.text?.toString().orEmpty().trim()
                 val x = xInput.text?.toString()?.toIntOrNull()?.coerceAtLeast(0) ?: 0
                 val y = yInput.text?.toString()?.toIntOrNull()?.coerceAtLeast(0) ?: 0
                 val waitMs = waitInput.text?.toString()?.toIntOrNull()?.coerceIn(300, 5000) ?: 1200
@@ -477,6 +518,8 @@ class FloatingControlService : Service() {
                 learnGoalId = goalId
                 learnActionType = actionType
                 learnIntent = intent
+                learnSkillTags = skillTags
+                learnSceneTags = sceneTags
                 learnX = x
                 learnY = y
                 learnWaitMs = waitMs
@@ -488,6 +531,8 @@ class FloatingControlService : Service() {
                         description = description,
                         actionType = actionType,
                         intent = intent,
+                        skillTags = skillTags,
+                        sceneTags = sceneTags,
                         x = x,
                         y = y,
                         waitMs = waitMs,
@@ -506,6 +551,7 @@ class FloatingControlService : Service() {
                                 statusText.text = "状态: 学习失败(${result.errorCode})"
                             }
                         }
+                        ensureOverlayVisible()
                     }
                 }
             }
