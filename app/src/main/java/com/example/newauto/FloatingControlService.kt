@@ -48,8 +48,8 @@ class FloatingControlService : Service() {
     @Volatile
     private var captureHideActive = false
 
-    private val learningClient by lazy { LearningClient(baseUrl = "http://127.0.0.1:8787") }
-    private val decisionClient by lazy { DecisionClient(baseUrl = "http://127.0.0.1:8787") }
+    private val learningClient by lazy { LearningClient(baseUrl = "http://127.0.0.1:8788") }
+    private val decisionClient by lazy { DecisionClient(baseUrl = "http://127.0.0.1:8788") }
     private val engine by lazy { AutomationEngine(this, decisionClient) { captureFrameWithoutOverlay() } }
 
     private var learningMode = false

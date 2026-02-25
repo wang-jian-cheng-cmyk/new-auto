@@ -24,6 +24,20 @@ data class ActionHistoryItem(
     val timestampMs: Long
 )
 
+data class UiActionableNode(
+    val nodeId: String,
+    val x1: Int,
+    val y1: Int,
+    val x2: Int,
+    val y2: Int,
+    val centerX: Int,
+    val centerY: Int,
+    val className: String,
+    val packageName: String,
+    val clickable: Boolean,
+    val enabled: Boolean
+)
+
 sealed class DecisionResult {
     data class Success(val response: DecisionResponse) : DecisionResult()
     data class Failure(

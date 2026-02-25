@@ -21,6 +21,7 @@ class DecisionClient(private val baseUrl: String) {
         sessionId: String,
         currentGoalId: String,
         history: List<ActionHistoryItem>,
+        actionableNodes: List<UiActionableNode>,
         screenshotPngBytes: ByteArray,
         screenW: Int,
         screenH: Int,
@@ -55,6 +56,28 @@ class DecisionClient(private val baseUrl: String) {
                 .addFormDataPart("orientation", orientation)
                 .addFormDataPart("history_json", historyJson.toString())
                 .addFormDataPart(
+                    "ui_nodes_json",
+                    JSONArray().apply {
+                        actionableNodes.forEach { n ->
+                            put(
+                                JSONObject().apply {
+                                    put("node_id", n.nodeId)
+                                    put("x1", n.x1)
+                                    put("y1", n.y1)
+                                    put("x2", n.x2)
+                                    put("y2", n.y2)
+                                    put("center_x", n.centerX)
+                                    put("center_y", n.centerY)
+                                    put("class", n.className)
+                                    put("package", n.packageName)
+                                    put("clickable", n.clickable)
+                                    put("enabled", n.enabled)
+                                }
+                            )
+                        }
+                    }.toString()
+                )
+                .addFormDataPart(
                     "screenshot_file",
                     "frame.png",
                     screenshotPngBytes.toRequestBody("image/png".toMediaType())
@@ -62,7 +85,7 @@ class DecisionClient(private val baseUrl: String) {
                 .build()
 
             val request = Request.Builder()
-                .url("$baseUrl/decide")
+                .url("$baseUrl/decide_v2")
                 .post(body)
                 .build()
 

@@ -46,10 +46,13 @@ class AutomationEngine(
         updateLatestHistoryEffect(frameHash)
         lastFrameHash = frameHash
 
+        val actionableNodes = AutomationAccessibilityService.instance?.dumpActionableNodes().orEmpty()
+
         return decisionClient.decide(
             sessionId = "device-local",
             currentGoalId = currentGoalId,
             history = history.toList(),
+            actionableNodes = actionableNodes,
             screenshotPngBytes = png,
             screenW = metrics.widthPixels,
             screenH = metrics.heightPixels,

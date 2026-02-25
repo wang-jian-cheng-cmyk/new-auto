@@ -1,101 +1,63 @@
-# New Auto (Accessibility + Learning + Gateway Decide)
+# New Auto V2
 
-This project now includes three capabilities:
+This repo now uses only the V2 framework.
 
-- Accessibility execution chain (`click`/`wait` execution on device)
-- Learning mode (`/learn` with before/after screenshots)
-- Gateway decision loop (`/decide` with `opencode run --file`)
+- Keep: accessibility execution (`AutomationAccessibilityService`)
+- Keep: floating control + learning submit
+- Use: `gateway_v2` only
+- Removed: old `gateway` framework
 
-## Main modules
+## V2 Rules
 
-- `app/src/main/java/com/example/newauto/AutomationAccessibilityService.kt`
-- `app/src/main/java/com/example/newauto/FloatingControlService.kt`
-- `app/src/main/java/com/example/newauto/ScreenCaptureManager.kt`
-- `app/src/main/java/com/example/newauto/LearningClient.kt`
-- `app/src/main/java/com/example/newauto/DecisionClient.kt`
-- `app/src/main/java/com/example/newauto/AutomationEngine.kt`
+- Page id is rule-generated from actionable button distribution.
+- Actionable button means: `clickable=true && enabled=true`.
+- `focusable` is ignored for game decision.
+- Decision output only: `click` or `wait`.
 
-Gateway side:
+## App Flow
 
-- `gateway/main.py`
-- `gateway/system_prompt.txt`
-- `gateway/experience_library.json`
+1. Accessibility service dumps actionable nodes.
+2. App captures screenshot (overlay hidden during capture).
+3. App sends `/decide_v2` with screenshot + actionable node list + recent history.
+4. Gateway returns `click/wait` and app executes with accessibility tap.
 
-## Run flow
+## Learning Flow
 
-1. Open app and grant overlay permission.
-2. Open accessibility settings and enable `New Auto` service.
-3. Grant screen capture permission.
-4. Start floating window.
+1. Use floating panel learning actions (`前截图/后截图/提交步骤/结束序列`).
+2. App sends `/learn_v2` with tags and coordinates.
+3. Gateway queues tasks in `gateway_v2/learn_queue.json`.
+4. Completed sequence becomes tagged skill in `gateway_v2/skill_library.json`.
 
-In floating panel:
-
-- Use `开始自动 / 暂停自动` to run decision loop.
-- Use `测试点击` to validate accessibility execution.
-- Use `查看屏幕大小` to read current resolution and orientation.
-- Turn on learning mode.
-- Record `学:记录前截图` and `学:记录后截图` around your manual operation.
-- Submit by `学:提交步骤` or finish sequence by `学:结束序列`.
-- Learning submit now uses queue persistence and tag fields (`skill_tags`, `scene_tags`).
-
-Gateway endpoint defaults to `http://127.0.0.1:8787` (`/decide`, `/learn`).
-
-Learning queue endpoint:
-
-- `GET /learn/queue`
-
-## Gateway run
+## Gateway V2
 
 ```bash
-cd gateway
+cd gateway_v2
 pip install -r requirements.txt
-./start_gateway_real.sh
+./start_gateway_v2.sh
 ```
 
-Check health:
+Health:
 
 ```bash
-cd gateway
-./check_gateway.sh
+cd gateway_v2
+./check_gateway_v2.sh
 ```
 
 Stop:
 
 ```bash
-cd gateway
-./stop_gateway.sh
+cd gateway_v2
+./stop_gateway_v2.sh
 ```
 
-## Decision protocol
+## XML Analysis API
 
-Gateway returns only:
+- `POST /v2/analyze_xml`
+  - input: `xml_file`, `screen_w`, `screen_h`, `orientation`, optional `screenshot_file`
+  - output: `page_id`, actionable button list, optional cropped button images
 
-- `action`: `click` or `wait`
-- `intent`: semantic intent (`tap_skip`, `toggle_auto_battle`, etc.)
-- `x`, `y`: pixel coordinates
-- `wait_ms`: delay before next frame
+## Build APK (GitHub Actions)
 
-No confidence field is used.
+Workflow file: `.github/workflows/android-apk.yml`
 
-## Skill trigger strategy
-
-The gateway uses `Rule -> Skill -> LLM Fallback`:
-
-1. If active skill sequence exists, execute next skill step.
-2. Else try matching saved skill preconditions.
-3. Else call `opencode run --file <frame>` only when needed (cooldown and wait-window aware).
-
-Learned sequences are persisted in `gateway/experience_library.json`.
-
-## Build APK on GitHub Actions
-
-This project includes CI build workflow:
-
-- `.github/workflows/android-apk.yml`
-
-How to use:
-
-1. Push this project to your GitHub repository.
-2. Open `Actions` tab.
-3. Run workflow `Build Android APK` (or trigger by push).
-4. Download artifact `new-auto-debug-apk`.
+Artifact: `new-auto-debug-apk`

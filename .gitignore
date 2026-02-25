@@ -6,8 +6,10 @@
 /captures/
 .DS_Store
 /app/build/
-gateway/tmp/
-gateway/learn_demos.jsonl
-gateway/learn_queue.json
-gateway/__pycache__/
 *.pyc
+gateway_v2/tmp/
+gateway_v2/crops/
+gateway_v2/page_library.json
+gateway_v2/skill_library.json
+gateway_v2/learn_queue.json
+__pycache__/

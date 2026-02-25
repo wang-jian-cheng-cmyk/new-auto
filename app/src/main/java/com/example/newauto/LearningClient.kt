@@ -57,7 +57,7 @@ class LearningClient(private val baseUrl: String) {
                 .build()
 
             val request = Request.Builder()
-                .url("$baseUrl/learn")
+                .url("$baseUrl/learn_v2")
                 .post(body)
                 .build()
 
