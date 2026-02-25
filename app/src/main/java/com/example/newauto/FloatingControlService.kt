@@ -12,11 +12,13 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -89,6 +91,7 @@ class FloatingControlService : Service() {
         }
         val toggleBtn = Button(this).apply { text = "收起" }
         val controlsLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val controlsScroll = ScrollView(this)
         var wmParams: WindowManager.LayoutParams? = null
 
         val startBtn = Button(this).apply { text = "开始自动" }
@@ -107,7 +110,7 @@ class FloatingControlService : Service() {
         var collapsed = false
         fun setCollapsed(value: Boolean) {
             collapsed = value
-            controlsLayout.visibility = if (collapsed) View.GONE else View.VISIBLE
+            controlsScroll.visibility = if (collapsed) View.GONE else View.VISIBLE
             statusText.visibility = if (collapsed) View.GONE else View.VISIBLE
             toggleBtn.text = if (collapsed) "◉" else "收起"
             layout.setPadding(
@@ -123,6 +126,32 @@ class FloatingControlService : Service() {
         }
 
         toggleBtn.setOnClickListener { setCollapsed(!collapsed) }
+
+        var dragStartX = 0
+        var dragStartY = 0
+        var touchStartRawX = 0f
+        var touchStartRawY = 0f
+        statusText.setOnTouchListener { _, event ->
+            val params = wmParams ?: return@setOnTouchListener false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragStartX = params.x
+                    dragStartY = params.y
+                    touchStartRawX = event.rawX
+                    touchStartRawY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - touchStartRawX).toInt()
+                    val dy = (event.rawY - touchStartRawY).toInt()
+                    params.x = dragStartX - dx
+                    params.y = dragStartY + dy
+                    windowManager.updateViewLayout(layout, params)
+                    true
+                }
+                else -> false
+            }
+        }
 
         startBtn.setOnClickListener {
             if (learningMode) {
@@ -227,17 +256,24 @@ class FloatingControlService : Service() {
         controlsLayout.addView(startBtn)
         controlsLayout.addView(pauseBtn)
         controlsLayout.addView(learnModeBtn)
-        controlsLayout.addView(testTapBtn)
-        controlsLayout.addView(screenInfoBtn)
-        controlsLayout.addView(openA11yBtn)
-        controlsLayout.addView(diagnoseBtn)
         controlsLayout.addView(learnBeforeBtn)
         controlsLayout.addView(learnAfterBtn)
         controlsLayout.addView(learnSubmitBtn)
         controlsLayout.addView(learnFinishBtn)
+        controlsLayout.addView(testTapBtn)
+        controlsLayout.addView(screenInfoBtn)
+        controlsLayout.addView(openA11yBtn)
+        controlsLayout.addView(diagnoseBtn)
         controlsLayout.addView(closeBtn)
         layout.addView(headerLayout)
-        layout.addView(controlsLayout)
+
+        val maxControlsHeight = (resources.displayMetrics.heightPixels * 0.62f).toInt().coerceAtLeast(240)
+        controlsScroll.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            maxControlsHeight
+        )
+        controlsScroll.addView(controlsLayout)
+        layout.addView(controlsScroll)
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -351,6 +387,9 @@ class FloatingControlService : Service() {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 20, 20, 20)
         }
+        val scroll = ScrollView(this).apply {
+            addView(container)
+        }
         val descInput = EditText(this).apply { hint = "步骤描述（手动输入）" }
         val goalInput = EditText(this).apply {
             hint = "goal_id"
@@ -387,7 +426,7 @@ class FloatingControlService : Service() {
 
         val dialog = AlertDialog.Builder(this)
             .setTitle(if (sequenceDone) "学习: 结束并生成序列" else "学习: 追加步骤")
-            .setView(container)
+            .setView(scroll)
             .setNegativeButton("取消", null)
             .setPositiveButton("提交") { _, _ ->
                 val description = descInput.text?.toString().orEmpty().trim()

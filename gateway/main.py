@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 import uuid
@@ -20,6 +21,7 @@ TMP_DIR.mkdir(exist_ok=True)
 SYSTEM_PROMPT = (BASE_DIR / "system_prompt.txt").read_text(encoding="utf-8")
 EXPERIENCE_LIBRARY_PATH = BASE_DIR / "experience_library.json"
 LEARN_DEMOS_PATH = BASE_DIR / "learn_demos.jsonl"
+MODEL = os.getenv("MODEL", "openai/gpt-5.2")
 
 if EXPERIENCE_LIBRARY_PATH.exists():
     EXPERIENCE_LIBRARY = json.loads(EXPERIENCE_LIBRARY_PATH.read_text(encoding="utf-8"))
@@ -80,6 +82,7 @@ app = FastAPI(title="New Auto Gateway", version="0.2.0")
 def health() -> dict:
     return {
         "ok": True,
+        "model": MODEL,
         "skills": len(EXPERIENCE_LIBRARY.get("skills", [])),
         "action_profiles": len(EXPERIENCE_LIBRARY.get("action_profiles", [])),
     }
@@ -501,7 +504,7 @@ def call_opencode(user_prompt: str, screenshot_file_path: str | None) -> str:
         f"{user_prompt}\n\n"
         "只输出一个JSON对象。"
     )
-    cmd = ["opencode", "run"]
+    cmd = ["opencode", "run", "--model", MODEL]
     if screenshot_file_path:
         cmd += ["--file", screenshot_file_path]
 
