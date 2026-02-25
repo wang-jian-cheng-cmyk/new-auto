@@ -263,10 +263,32 @@ async def debug_probe(
 
     page_id = build_page_id_from_raw_nodes(raw_nodes)
     prompt = build_debug_probe_prompt(goal_id, page_id, raw_nodes, ui_xml_like)
-    payload = extract_json(call_opencode(prompt, str(screenshot_path)))
-    candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
-    if not isinstance(candidates, list):
-        candidates = []
+
+    ok = True
+    candidates: list[dict[str, Any]] = []
+    analysis_reason = ""
+    failure_reason = ""
+    evidence: list[str] = []
+
+    try:
+        payload = extract_json(call_opencode(prompt, str(screenshot_path)))
+        if isinstance(payload, dict):
+            parsed_candidates = payload.get("candidates", [])
+            if isinstance(parsed_candidates, list):
+                candidates = [x for x in parsed_candidates if isinstance(x, dict)]
+            analysis_reason = str(payload.get("analysis_reason", "")).strip()
+            failure_reason = str(payload.get("failure_reason", "")).strip()
+            parsed_evidence = payload.get("evidence", [])
+            if isinstance(parsed_evidence, list):
+                evidence = [str(x) for x in parsed_evidence][:8]
+    except Exception as exc:
+        ok = False
+        failure_reason = f"model_call_failed: {exc}"
+
+    if not analysis_reason:
+        analysis_reason = infer_default_analysis_reason(raw_nodes, candidates)
+    if not candidates and not failure_reason:
+        failure_reason = infer_default_failure_reason(raw_nodes)
 
     log_event(
         "debug_probe_done",
@@ -274,15 +296,21 @@ async def debug_probe(
         page_id=page_id,
         raw_nodes=len(raw_nodes),
         candidates=len(candidates),
+        ok=ok,
+        analysis_reason=analysis_reason,
+        failure_reason=failure_reason,
         elapsed_ms=int((time.time() - started) * 1000),
     )
     return {
-        "ok": True,
+        "ok": ok,
         "request_id": request_id,
         "goal_id": goal_id,
         "page_id": page_id,
         "raw_node_count": len(raw_nodes),
         "candidates": candidates,
+        "analysis_reason": analysis_reason,
+        "failure_reason": failure_reason,
+        "evidence": evidence,
     }
 
 
@@ -883,12 +911,16 @@ def build_debug_probe_prompt(goal_id: str, page_id: str, raw_nodes: list[dict], 
                     "cx": 0,
                     "cy": 0,
                 }
-            ]
+            ],
+            "analysis_reason": "必填，解释本次判断逻辑",
+            "failure_reason": "当candidates为空时必填，解释为什么无法给出候选",
+            "evidence": ["可选，列出节点或区域依据"],
         },
         "rules": [
             "只输出JSON对象",
             "候选可以来自非clickable节点",
             "优先输出有明确语义的按钮",
+            "即使没有候选，也必须输出analysis_reason和failure_reason",
         ],
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -912,7 +944,12 @@ def call_opencode(user_prompt: str, screenshot_file_path: str | None) -> str:
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
     if result.returncode == 0 and stdout:
-        log_event("opencode_call_done", returncode=result.returncode, stdout_len=len(stdout))
+        log_event(
+            "opencode_call_done",
+            returncode=result.returncode,
+            stdout_len=len(stdout),
+            stdout_preview=stdout[:500],
+        )
         return stdout
     log_event("opencode_call_failed", returncode=result.returncode, stderr=stderr[:180])
     raise HTTPException(status_code=503, detail={"error_code": "opencode_failed", "error_message": stderr[:280] or "empty"})
@@ -988,6 +1025,30 @@ def sanitize_filename(name: str) -> str:
 
 def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+def infer_default_analysis_reason(raw_nodes: list[dict], candidates: list[dict]) -> str:
+    if candidates:
+        return "模型根据截图与原始节点给出了候选按钮。"
+    if not raw_nodes:
+        return "未收到任何原始节点，无法建立页面可交互结构。"
+    clickable_count = 0
+    enabled_count = 0
+    for node in raw_nodes:
+        if isinstance(node, dict):
+            if bool(node.get("clickable", False)):
+                clickable_count += 1
+            if bool(node.get("enabled", False)):
+                enabled_count += 1
+    return f"收到{len(raw_nodes)}个原始节点，其中clickable={clickable_count}，enabled={enabled_count}。"
+
+
+def infer_default_failure_reason(raw_nodes: list[dict]) -> str:
+    if not raw_nodes:
+        return "原始节点为空，无法识别按钮候选。"
+    if len(raw_nodes) <= 2:
+        return "原始节点极少，且多为容器/整屏视图，缺乏可分离按钮特征。"
+    return "当前页面结构信息不足或视觉特征不明确，模型未找到高可信候选。"
 
 
 def persist_page_library() -> None:
