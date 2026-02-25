@@ -84,23 +84,27 @@ class AutomationAccessibilityService : AccessibilityService() {
         return performGlobalAction(GLOBAL_ACTION_BACK)
     }
 
-    fun dumpActionableNodes(maxNodes: Int = 120): List<UiActionableNode> {
+    fun dumpDecisionNodes(maxNodes: Int = 120): List<UiActionableNode> {
         val root = rootInActiveWindow ?: return emptyList()
-        val out = ArrayList<UiActionableNode>()
+        val actionableOut = ArrayList<UiActionableNode>()
+        val candidateOut = ArrayList<UiActionableNode>()
         val seen = HashSet<String>()
+        val rootRect = Rect().also { root.getBoundsInScreen(it) }
+        val rootArea = (rootRect.width().coerceAtLeast(1) * rootRect.height().coerceAtLeast(1)).toFloat()
 
         fun walk(node: AccessibilityNodeInfo?) {
-            if (node == null || out.size >= maxNodes) return
+            if (node == null || (actionableOut.size + candidateOut.size) >= maxNodes) return
 
             val rect = Rect()
             node.getBoundsInScreen(rect)
             val validRect = rect.right > rect.left && rect.bottom > rect.top
             val clickable = node.isClickable
             val enabled = node.isEnabled
+
             if (validRect && clickable && enabled) {
-                val key = "${rect.left},${rect.top},${rect.right},${rect.bottom}|${node.className}|${node.packageName}"
+                val key = "${rect.left},${rect.top},${rect.right},${rect.bottom}|${node.className}|${node.packageName}|l1"
                 if (seen.add(key)) {
-                    out.add(
+                    actionableOut.add(
                         UiActionableNode(
                             nodeId = sha1Hex(key).take(16),
                             x1 = rect.left,
@@ -112,9 +116,40 @@ class AutomationAccessibilityService : AccessibilityService() {
                             className = node.className?.toString().orEmpty(),
                             packageName = node.packageName?.toString().orEmpty(),
                             clickable = true,
-                            enabled = true
+                            enabled = true,
+                            actionable = true,
+                            source = "level1_clickable"
                         )
                     )
+                }
+            } else if (validRect && enabled && !clickable) {
+                val area = rect.width() * rect.height()
+                val areaRatio = area / rootArea
+                val isLeaf = node.childCount == 0
+                val className = node.className?.toString().orEmpty()
+                val isLikelyView = className.contains("View") || className.contains("Button") || className.contains("Image")
+                val validArea = areaRatio in 0.003f..0.25f
+                if (isLeaf && isLikelyView && validArea) {
+                    val key = "${rect.left},${rect.top},${rect.right},${rect.bottom}|${className}|${node.packageName}|l2"
+                    if (seen.add(key)) {
+                        candidateOut.add(
+                            UiActionableNode(
+                                nodeId = sha1Hex(key).take(16),
+                                x1 = rect.left,
+                                y1 = rect.top,
+                                x2 = rect.right,
+                                y2 = rect.bottom,
+                                centerX = (rect.left + rect.right) / 2,
+                                centerY = (rect.top + rect.bottom) / 2,
+                                className = className,
+                                packageName = node.packageName?.toString().orEmpty(),
+                                clickable = false,
+                                enabled = true,
+                                actionable = false,
+                                source = "level2_candidate"
+                            )
+                        )
+                    }
                 }
             }
 
@@ -124,7 +159,7 @@ class AutomationAccessibilityService : AccessibilityService() {
         }
 
         walk(root)
-        return out
+        return if (actionableOut.isNotEmpty()) actionableOut else candidateOut
     }
 
     private fun sha1Hex(raw: String): String {

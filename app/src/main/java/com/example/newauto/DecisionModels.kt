@@ -35,7 +35,9 @@ data class UiActionableNode(
     val className: String,
     val packageName: String,
     val clickable: Boolean,
-    val enabled: Boolean
+    val enabled: Boolean,
+    val actionable: Boolean,
+    val source: String
 )
 
 sealed class DecisionResult {

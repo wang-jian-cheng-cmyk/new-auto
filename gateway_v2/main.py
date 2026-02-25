@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import time
@@ -33,6 +34,13 @@ MODEL = os.getenv("MODEL", "openai/gpt-5.2")
 PAGE_LIBRARY_PATH = BASE_DIR / "page_library.json"
 SKILL_LIBRARY_PATH = BASE_DIR / "skill_library.json"
 LEARN_QUEUE_PATH = BASE_DIR / "learn_queue.json"
+
+LOG_LEVEL = os.getenv("GATEWAY_V2_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [gateway_v2] %(message)s",
+)
+LOGGER = logging.getLogger("gateway_v2")
 
 TMP_DIR.mkdir(exist_ok=True)
 CROPS_DIR.mkdir(exist_ok=True)
@@ -77,6 +85,8 @@ class UiNodeItem(BaseModel):
     package_name: str = Field(alias="package")
     clickable: bool
     enabled: bool
+    actionable: bool = False
+    source: str = "unknown"
 
 
 class DecideRequestV2(BaseModel):
@@ -119,9 +129,29 @@ LEARN_QUEUE_LOCK = asyncio.Lock()
 app = FastAPI(title="New Auto Gateway V2", version="0.2.0")
 
 
+def log_event(event: str, **kwargs: Any) -> None:
+    payload = {"event": event, **kwargs}
+    try:
+        LOGGER.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        LOGGER.info("%s %s", event, kwargs)
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    log_event(
+        "startup",
+        model=MODEL,
+        pages=len(PAGE_LIBRARY.get("pages", {})),
+        skills=len(SKILL_LIBRARY.get("skills", [])),
+        queue=len(LEARN_QUEUE),
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     pending = len([x for x in LEARN_QUEUE if x.get("status") in {"pending", "failed"}])
+    log_event("health_check", pending=pending)
     return {
         "ok": True,
         "model": MODEL,
@@ -156,8 +186,11 @@ async def analyze_xml_endpoint(
     persist_page: bool = Form(True),
 ) -> dict[str, Any]:
     request_id = uuid.uuid4().hex[:12]
+    started = time.time()
+    log_event("analyze_xml_start", request_id=request_id, orientation=orientation, screen_w=screen_w, screen_h=screen_h)
     xml_text = (await xml_file.read()).decode("utf-8", errors="ignore")
     if not xml_text.strip():
+        log_event("analyze_xml_error", request_id=request_id, error="empty_xml")
         raise HTTPException(status_code=422, detail={"error_code": "empty_xml", "request_id": request_id})
 
     report = analyze_xml(xml_text, screen_w=screen_w, screen_h=screen_h, orientation=orientation)
@@ -172,6 +205,13 @@ async def analyze_xml_endpoint(
         actionable = filter_actionable_nodes(nodes)
         page_crop_dir = CROPS_DIR / page_id
         crops = crop_actionable_buttons(screenshot_name, actionable, page_crop_dir)
+        log_event(
+            "analyze_xml_crops",
+            request_id=request_id,
+            page_id=page_id,
+            actionable_nodes=len(actionable),
+            crop_count=len(crops),
+        )
 
     if persist_page:
         PAGE_LIBRARY.setdefault("pages", {})[page_id] = {
@@ -180,6 +220,16 @@ async def analyze_xml_endpoint(
             "buttons": report["buttons"],
         }
         persist_page_library()
+        log_event("analyze_xml_persisted", request_id=request_id, page_id=page_id, buttons=len(report["buttons"]))
+
+    log_event(
+        "analyze_xml_done",
+        request_id=request_id,
+        page_id=page_id,
+        total_nodes=report["total_nodes"],
+        actionable_nodes=report["actionable_nodes"],
+        elapsed_ms=int((time.time() - started) * 1000),
+    )
 
     return {
         "ok": True,
@@ -195,6 +245,7 @@ async def analyze_xml_endpoint(
 @app.post("/learn_v2")
 async def learn_v2(request: Request) -> dict[str, Any]:
     request_id = uuid.uuid4().hex[:12]
+    started = time.time()
     form = await request.form()
     try:
         session_id = str(form.get("session_id", "device-local"))
@@ -211,9 +262,11 @@ async def learn_v2(request: Request) -> dict[str, Any]:
         before_file = form.get("before_file")
         after_file = form.get("after_file")
     except Exception as exc:
+        LOGGER.exception("learn_v2_parse_failed request_id=%s", request_id)
         raise HTTPException(status_code=422, detail={"error_code": "learn_parse_failed", "error_message": str(exc)}) from exc
 
     if before_file is None or after_file is None:
+        log_event("learn_v2_error", request_id=request_id, error="learn_missing_screenshots")
         raise HTTPException(status_code=422, detail={"error_code": "learn_missing_screenshots"})
 
     before_name = TMP_DIR / sanitize_filename(f"learn-before-{request_id}.png")
@@ -244,9 +297,24 @@ async def learn_v2(request: Request) -> dict[str, Any]:
     }
     LEARN_QUEUE.append(task)
     persist_learn_queue()
+    log_event(
+        "learn_v2_queued",
+        request_id=request_id,
+        goal_id=goal_id,
+        intent=intent,
+        sequence_done=sequence_done,
+        queue_size=len(LEARN_QUEUE),
+    )
     await process_learn_queue()
 
     item = next((x for x in LEARN_QUEUE if x.get("task_id") == request_id), task)
+    log_event(
+        "learn_v2_done",
+        request_id=request_id,
+        status=item.get("status"),
+        retry_count=item.get("retry_count", 0),
+        elapsed_ms=int((time.time() - started) * 1000),
+    )
     return {
         "ok": item.get("status") == "done",
         "task_id": request_id,
@@ -257,39 +325,127 @@ async def learn_v2(request: Request) -> dict[str, Any]:
 
 @app.post("/decide_v2", response_model=DecideResponseV2)
 async def decide_v2(request: Request) -> DecideResponseV2:
-    req = await parse_decide_v2_request(request)
-    session = SESSION_STORE.setdefault(req.session_id, SessionContext())
+    request_id = uuid.uuid4().hex[:12]
+    started = time.time()
+    try:
+        req = await parse_decide_v2_request(request)
+        session = SESSION_STORE.setdefault(req.session_id, SessionContext())
 
-    if req.orientation != "landscape" or req.screen_w <= req.screen_h:
-        return fallback_wait(req.current_goal_id, "only_landscape_supported")
+        log_event(
+            "decide_v2_start",
+            request_id=request_id,
+            session_id=req.session_id,
+            goal_id=req.current_goal_id,
+            orientation=req.orientation,
+            screen_w=req.screen_w,
+            screen_h=req.screen_h,
+            history_count=len(req.history),
+            ui_nodes_count=len(req.ui_nodes),
+        )
 
-    nodes = [n for n in req.ui_nodes if n.clickable and n.enabled]
-    page_id = page_id_from_nodes(nodes, req.screen_w, req.screen_h, req.orientation)
-    session.recent_page_ids.append(page_id)
+        if req.orientation != "landscape" or req.screen_w <= req.screen_h:
+            resp = fallback_wait(req.current_goal_id, "only_landscape_supported")
+            log_event("decide_v2_done", request_id=request_id, strategy="orientation_guard", action=resp.action, reason=resp.reason)
+            return resp
 
-    persist_page_if_new(page_id, req)
+        level1_nodes = [n for n in req.ui_nodes if n.clickable and n.enabled]
+        level2_nodes = [n for n in req.ui_nodes if (not n.clickable) and n.enabled]
+        nodes_for_page = level1_nodes if level1_nodes else level2_nodes
+        page_id = page_id_from_nodes(nodes_for_page, req.screen_w, req.screen_h, req.orientation)
+        session.recent_page_ids.append(page_id)
+        log_event(
+            "decide_v2_node_split",
+            request_id=request_id,
+            page_id=page_id,
+            level1_count=len(level1_nodes),
+            level2_count=len(level2_nodes),
+            page_source=("level1" if level1_nodes else "level2"),
+        )
 
-    skill_step = next_skill_step(req.current_goal_id, session)
-    if skill_step is not None:
-        return skill_step
+        persist_page_if_new(page_id, req)
 
-    triggered = trigger_skill(req.current_goal_id, req.history, page_id, session)
-    if triggered is not None:
-        return triggered
+        skill_step = next_skill_step(req.current_goal_id, session)
+        if skill_step is not None:
+            log_event(
+                "decide_v2_done",
+                request_id=request_id,
+                strategy="active_skill",
+                page_id=page_id,
+                action=skill_step.action,
+                skill_id=skill_step.skill_id,
+                step_index=skill_step.step_index,
+                elapsed_ms=int((time.time() - started) * 1000),
+            )
+            return skill_step
 
-    now = int(time.time() * 1000)
-    if now < session.model_cooldown_until_ms:
-        return fallback_wait(req.current_goal_id, "model_cooldown", 600)
+        triggered = trigger_skill(req.current_goal_id, req.history, page_id, session)
+        if triggered is not None:
+            log_event(
+                "decide_v2_done",
+                request_id=request_id,
+                strategy="trigger_skill",
+                page_id=page_id,
+                action=triggered.action,
+                skill_id=triggered.skill_id,
+                step_index=triggered.step_index,
+                elapsed_ms=int((time.time() - started) * 1000),
+            )
+            return triggered
 
-    if not nodes:
-        return fallback_wait(req.current_goal_id, "no_actionable_buttons", 900)
+        now = int(time.time() * 1000)
+        if now < session.model_cooldown_until_ms:
+            resp = fallback_wait(req.current_goal_id, "model_cooldown", 600)
+            log_event("decide_v2_done", request_id=request_id, strategy="cooldown_wait", page_id=page_id, action=resp.action, reason=resp.reason)
+            return resp
 
-    if should_use_model(req.history):
-        payload = extract_json(call_opencode(build_user_prompt(req, page_id, nodes), req.screenshot_file_path))
-        session.model_cooldown_until_ms = now + 900
-        return normalize_model_response(payload, req.current_goal_id, nodes)
+        if not nodes_for_page:
+            resp = fallback_wait(req.current_goal_id, "no_actionable_buttons", 900)
+            log_event("decide_v2_done", request_id=request_id, strategy="no_nodes_wait", page_id=page_id, action=resp.action, reason=resp.reason)
+            return resp
 
-    return choose_rule_action(req.current_goal_id, nodes)
+        if should_use_model(req.history):
+            payload = extract_json(call_opencode(build_user_prompt(req, page_id, level1_nodes, level2_nodes), req.screenshot_file_path))
+            session.model_cooldown_until_ms = now + 900
+            resp = normalize_model_response(payload, req.current_goal_id, nodes_for_page)
+            log_event(
+                "decide_v2_done",
+                request_id=request_id,
+                strategy="model",
+                page_id=page_id,
+                action=resp.action,
+                intent=resp.intent,
+                x=resp.x,
+                y=resp.y,
+                wait_ms=resp.wait_ms,
+                elapsed_ms=int((time.time() - started) * 1000),
+            )
+            return resp
+
+        if level1_nodes:
+            resp = choose_rule_action(req.current_goal_id, level1_nodes)
+            strategy = "rule_level1"
+        else:
+            resp = fallback_wait(req.current_goal_id, "level2_candidates_need_model", 1200)
+            strategy = "level2_wait"
+        log_event(
+            "decide_v2_done",
+            request_id=request_id,
+            strategy=strategy,
+            page_id=page_id,
+            action=resp.action,
+            intent=resp.intent,
+            x=resp.x,
+            y=resp.y,
+            wait_ms=resp.wait_ms,
+            elapsed_ms=int((time.time() - started) * 1000),
+        )
+        return resp
+    except HTTPException as exc:
+        log_event("decide_v2_http_error", request_id=request_id, status=exc.status_code, detail=exc.detail)
+        raise
+    except Exception as exc:
+        LOGGER.exception("decide_v2_unhandled request_id=%s error=%s", request_id, exc)
+        raise HTTPException(status_code=500, detail={"error_code": "decide_v2_internal_error", "request_id": request_id}) from exc
 
 
 async def process_learn_queue() -> None:
@@ -306,10 +462,16 @@ async def process_learn_queue() -> None:
                 item["message"] = process_learn_task(item)
                 item["status"] = "done"
                 item["last_error"] = ""
+                log_event(
+                    "learn_queue_item_done",
+                    task_id=item.get("task_id"),
+                    message=item.get("message", ""),
+                )
             except Exception as exc:
                 item["status"] = "failed"
                 item["retry_count"] = int(item.get("retry_count", 0)) + 1
                 item["last_error"] = str(exc)
+                LOGGER.exception("learn_queue_item_failed task_id=%s", item.get("task_id"))
             item["updated_at_ms"] = int(time.time() * 1000)
             changed = True
 
@@ -340,6 +502,7 @@ def process_learn_task(task: dict) -> str:
 
     LEARN_SESSION_BUFFER.setdefault(session_id, []).append(step)
     if not sequence_done:
+        log_event("learn_step_buffered", task_id=task.get("task_id"), session_id=session_id, goal_id=goal_id)
         return "learn step appended"
 
     steps = LEARN_SESSION_BUFFER.pop(session_id, [])
@@ -357,6 +520,13 @@ def process_learn_task(task: dict) -> str:
         "stats": {"success": 0, "failed": 0, "updated_at_ms": int(time.time() * 1000)},
     }
     SKILL_LIBRARY.setdefault("skills", []).append(skill)
+    log_event(
+        "skill_saved",
+        task_id=task.get("task_id"),
+        skill_id=skill["skill_id"],
+        goal_id=goal_id,
+        steps=len(steps),
+    )
     return f"saved {skill['skill_id']}"
 
 
@@ -398,6 +568,7 @@ async def parse_decide_v2_request(request: Request) -> DecideRequestV2:
         raise HTTPException(status_code=422, detail={"error_code": "missing_screenshot_file"})
     frame_path = TMP_DIR / sanitize_filename(f"frame-{uuid.uuid4().hex[:10]}.png")
     frame_path.write_bytes(await screenshot_file.read())
+    log_event("decide_v2_frame_saved", frame_path=str(frame_path))
     return parse_decide_v2_payload(form, str(frame_path))
 
 
@@ -550,17 +721,22 @@ def persist_page_if_new(page_id: str, req: DecideRequestV2) -> None:
 
     buttons = []
     for n in req.ui_nodes:
-        if not (n.clickable and n.enabled):
+        if not n.enabled:
             continue
         buttons.append(
             {
                 "button_id": n.node_id,
                 "bounds": {"x1": n.x1, "y1": n.y1, "x2": n.x2, "y2": n.y2},
                 "center": {"x": n.center_x, "y": n.center_y},
-                "state": {"clickable": n.clickable, "enabled": n.enabled, "actionable": True},
+                "state": {
+                    "clickable": n.clickable,
+                    "enabled": n.enabled,
+                    "actionable": (n.clickable and n.enabled) or n.actionable,
+                },
                 "class": n.class_name,
                 "package": n.package_name,
                 "intent_tag": "unknown",
+                "source": n.source,
             }
         )
 
@@ -572,16 +748,32 @@ def persist_page_if_new(page_id: str, req: DecideRequestV2) -> None:
     persist_page_library()
 
 
-def build_user_prompt(req: DecideRequestV2, page_id: str, nodes: list[UiNodeItem]) -> str:
-    button_list = []
-    for n in nodes:
-        button_list.append(
+def build_user_prompt(
+    req: DecideRequestV2,
+    page_id: str,
+    level1_nodes: list[UiNodeItem],
+    level2_nodes: list[UiNodeItem],
+) -> str:
+    actionable_buttons = []
+    for n in level1_nodes:
+        actionable_buttons.append(
             {
                 "button_id": n.node_id,
                 "center": {"x": n.center_x, "y": n.center_y},
                 "class": n.class_name,
-                "enabled": n.enabled,
-                "clickable": n.clickable,
+                "source": "level1_clickable",
+            }
+        )
+
+    candidate_buttons = []
+    for n in level2_nodes[:18]:
+        candidate_buttons.append(
+            {
+                "button_id": n.node_id,
+                "bounds": {"x1": n.x1, "y1": n.y1, "x2": n.x2, "y2": n.y2},
+                "center": {"x": n.center_x, "y": n.center_y},
+                "class": n.class_name,
+                "source": "level2_candidate",
             }
         )
 
@@ -590,11 +782,17 @@ def build_user_prompt(req: DecideRequestV2, page_id: str, nodes: list[UiNodeItem
         "page_id": page_id,
         "goal_id": req.current_goal_id,
         "history": [h.model_dump() for h in req.history[-6:]],
-        "actionable_buttons": button_list,
+        "actionable_buttons": actionable_buttons,
+        "candidate_buttons": candidate_buttons,
+        "rules": [
+            "优先从actionable_buttons选择button_id",
+            "若actionable_buttons为空，可从candidate_buttons选择最像按钮的目标",
+            "若仍不确定，action=wait",
+        ],
         "output": {
             "action": "click|wait",
             "intent": "semantic_intent",
-            "button_id": "must from actionable_buttons when action=click",
+            "button_id": "must from actionable_buttons or candidate_buttons when action=click",
             "wait_ms": "300-5000",
             "goal_id": req.current_goal_id,
             "reason": "short_cn_reason",
@@ -615,11 +813,15 @@ def call_opencode(user_prompt: str, screenshot_file_path: str | None) -> str:
     if screenshot_file_path:
         cmd += ["--file", screenshot_file_path]
 
+    log_event("opencode_call_start", model=MODEL, with_file=bool(screenshot_file_path))
+
     result = subprocess.run(cmd, input=combined, capture_output=True, text=True, timeout=45, check=False)
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
     if result.returncode == 0 and stdout:
+        log_event("opencode_call_done", returncode=result.returncode, stdout_len=len(stdout))
         return stdout
+    log_event("opencode_call_failed", returncode=result.returncode, stderr=stderr[:180])
     raise HTTPException(status_code=503, detail={"error_code": "opencode_failed", "error_message": stderr[:280] or "empty"})
 
 
@@ -644,12 +846,24 @@ def parse_ui_nodes_json(raw: str) -> list[UiNodeItem]:
     if not isinstance(data, list):
         return []
     items: list[UiNodeItem] = []
+    actionable_count = 0
+    candidate_count = 0
     for x in data:
         if not isinstance(x, dict):
             continue
-        if not (x.get("clickable") is True and x.get("enabled") is True):
-            continue
-        items.append(UiNodeItem(**x))
+        item = UiNodeItem(**x)
+        if item.clickable and item.enabled:
+            actionable_count += 1
+        elif item.enabled:
+            candidate_count += 1
+        items.append(item)
+    log_event(
+        "parse_ui_nodes",
+        received=len(data),
+        total=len(items),
+        actionable=actionable_count,
+        candidates=candidate_count,
+    )
     return items
 
 
@@ -685,11 +899,14 @@ def clamp(v: int, lo: int, hi: int) -> int:
 
 def persist_page_library() -> None:
     PAGE_LIBRARY_PATH.write_text(json.dumps(PAGE_LIBRARY, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_event("persist_page_library", pages=len(PAGE_LIBRARY.get("pages", {})))
 
 
 def persist_skill_library() -> None:
     SKILL_LIBRARY_PATH.write_text(json.dumps(SKILL_LIBRARY, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_event("persist_skill_library", skills=len(SKILL_LIBRARY.get("skills", [])))
 
 
 def persist_learn_queue() -> None:
     LEARN_QUEUE_PATH.write_text(json.dumps(LEARN_QUEUE, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_event("persist_learn_queue", queue_size=len(LEARN_QUEUE))

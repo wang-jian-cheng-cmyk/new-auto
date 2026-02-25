@@ -11,6 +11,7 @@ This repo now uses only the V2 framework.
 
 - Page id is rule-generated from actionable button distribution.
 - Actionable button means: `clickable=true && enabled=true`.
+- If actionable list is empty, use level2 candidate nodes (`enabled=true`, non-clickable leaf views with valid area) as fallback.
 - `focusable` is ignored for game decision.
 - Decision output only: `click` or `wait`.
 

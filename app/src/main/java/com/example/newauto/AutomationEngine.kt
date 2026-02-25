@@ -46,7 +46,7 @@ class AutomationEngine(
         updateLatestHistoryEffect(frameHash)
         lastFrameHash = frameHash
 
-        val actionableNodes = AutomationAccessibilityService.instance?.dumpActionableNodes().orEmpty()
+        val actionableNodes = AutomationAccessibilityService.instance?.dumpDecisionNodes().orEmpty()
 
         return decisionClient.decide(
             sessionId = "device-local",

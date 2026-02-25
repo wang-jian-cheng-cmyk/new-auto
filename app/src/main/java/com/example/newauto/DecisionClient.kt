@@ -72,6 +72,8 @@ class DecisionClient(private val baseUrl: String) {
                                     put("package", n.packageName)
                                     put("clickable", n.clickable)
                                     put("enabled", n.enabled)
+                                    put("actionable", n.actionable)
+                                    put("source", n.source)
                                 }
                             )
                         }
