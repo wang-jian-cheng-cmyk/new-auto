@@ -29,6 +29,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 class FloatingControlService : Service() {
@@ -42,10 +44,11 @@ class FloatingControlService : Service() {
     private var rootView: View? = null
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var loopJob: Job? = null
+    private val captureMutex = Mutex()
 
     private val learningClient by lazy { LearningClient(baseUrl = "http://127.0.0.1:8787") }
     private val decisionClient by lazy { DecisionClient(baseUrl = "http://127.0.0.1:8787") }
-    private val engine by lazy { AutomationEngine(this, decisionClient) }
+    private val engine by lazy { AutomationEngine(this, decisionClient) { captureFrameWithoutOverlay() } }
 
     private var learningMode = false
     private var learningBeforePng: ByteArray? = null
@@ -204,32 +207,46 @@ class FloatingControlService : Service() {
         }
 
         learnBeforeBtn.setOnClickListener {
-            val ok = ScreenCaptureManager.initIfNeeded(this)
-            if (!ok) {
-                statusText.text = "状态: 请先在主界面申请录屏权限"
-                return@setOnClickListener
-            }
-            val png = ScreenCaptureManager.capturePngBytes()
-            if (png == null) {
-                statusText.text = "状态: 前截图失败"
-            } else {
-                learningBeforePng = png
-                statusText.text = "状态: 已记录前截图"
+            serviceScope.launch(Dispatchers.IO) {
+                val ok = ScreenCaptureManager.initIfNeeded(this@FloatingControlService)
+                withContext(Dispatchers.Main) {
+                    if (!ok) {
+                        statusText.text = "状态: 请先在主界面申请录屏权限"
+                    }
+                }
+                if (!ok) return@launch
+
+                val png = captureFrameWithoutOverlay()
+                withContext(Dispatchers.Main) {
+                    if (png == null) {
+                        statusText.text = "状态: 前截图失败"
+                    } else {
+                        learningBeforePng = png
+                        statusText.text = "状态: 已记录前截图"
+                    }
+                }
             }
         }
 
         learnAfterBtn.setOnClickListener {
-            val ok = ScreenCaptureManager.initIfNeeded(this)
-            if (!ok) {
-                statusText.text = "状态: 请先在主界面申请录屏权限"
-                return@setOnClickListener
-            }
-            val png = ScreenCaptureManager.capturePngBytes()
-            if (png == null) {
-                statusText.text = "状态: 后截图失败"
-            } else {
-                learningAfterPng = png
-                statusText.text = "状态: 已记录后截图"
+            serviceScope.launch(Dispatchers.IO) {
+                val ok = ScreenCaptureManager.initIfNeeded(this@FloatingControlService)
+                withContext(Dispatchers.Main) {
+                    if (!ok) {
+                        statusText.text = "状态: 请先在主界面申请录屏权限"
+                    }
+                }
+                if (!ok) return@launch
+
+                val png = captureFrameWithoutOverlay()
+                withContext(Dispatchers.Main) {
+                    if (png == null) {
+                        statusText.text = "状态: 后截图失败"
+                    } else {
+                        learningAfterPng = png
+                        statusText.text = "状态: 已记录后截图"
+                    }
+                }
             }
         }
 
@@ -357,6 +374,26 @@ class FloatingControlService : Service() {
         val metrics = resources.displayMetrics
         val orientation = if (metrics.widthPixels > metrics.heightPixels) "横屏" else "竖屏"
         return "${metrics.widthPixels}x${metrics.heightPixels} ($orientation)"
+    }
+
+    private suspend fun captureFrameWithoutOverlay(): ByteArray? {
+        return captureMutex.withLock {
+            val view = rootView
+            if (view == null) return@withLock ScreenCaptureManager.capturePngBytes()
+            try {
+                withContext(Dispatchers.Main) {
+                    view.visibility = View.GONE
+                }
+                delay(80)
+                ScreenCaptureManager.capturePngBytes()
+            } finally {
+                withContext(Dispatchers.Main) {
+                    if (view.parent != null) {
+                        view.visibility = View.VISIBLE
+                    }
+                }
+            }
+        }
     }
 
     private fun createNotificationChannel() {

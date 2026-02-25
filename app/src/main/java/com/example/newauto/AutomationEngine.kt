@@ -6,7 +6,8 @@ import java.util.ArrayDeque
 
 class AutomationEngine(
     context: Context,
-    private val decisionClient: DecisionClient
+    private val decisionClient: DecisionClient,
+    private val captureFrame: suspend () -> ByteArray?
 ) {
     private val appContext = context.applicationContext
     private val history = ArrayDeque<ActionHistoryItem>()
@@ -14,7 +15,7 @@ class AutomationEngine(
     private var pendingDecision: DecisionResponse? = null
     private var currentGoalId: String = "daily_loop"
 
-    fun decideNextAction(): DecisionResult {
+    suspend fun decideNextAction(): DecisionResult {
         if (!ScreenCaptureManager.initIfNeeded(appContext)) {
             return DecisionResult.Failure(
                 errorCode = "capture_not_ready",
@@ -34,7 +35,7 @@ class AutomationEngine(
             )
         }
 
-        val png = ScreenCaptureManager.capturePngBytes() ?: return DecisionResult.Failure(
+        val png = captureFrame() ?: return DecisionResult.Failure(
             errorCode = "capture_frame_empty",
             errorMessage = "failed to capture frame",
             requestId = "",
